@@ -9,7 +9,6 @@
 #include <sprintf.h>
 #include <vm.h>
 #include <bits.h>
-#include <uart16550.h>
 #include <e820.h>
 #include <multiboot.h>
 #include <vtd.h>
@@ -22,7 +21,6 @@
 #include <pgtable.h>
 #include <mmu.h>
 #include <logmsg.h>
-#include <cat.h>
 #include <firmware.h>
 #include <board.h>
 
@@ -33,6 +31,8 @@ vm_sw_loader_t vm_sw_loader;
 static struct acrn_vm vm_array[CONFIG_MAX_VM_NUM] __aligned(PAGE_SIZE);
 
 static struct acrn_vm *sos_vm_ptr = NULL;
+
+static struct e820_entry sos_ve820[E820_MAX_ENTRIES];
 
 uint16_t get_vmid_by_uuid(const uint8_t *uuid)
 {
@@ -47,23 +47,26 @@ uint16_t get_vmid_by_uuid(const uint8_t *uuid)
 	return vm_id;
 }
 
+/**
+ * @pre vm != NULL
+ */
 bool is_valid_vm(const struct acrn_vm *vm)
 {
-	return (vm != NULL) && (vm->state != VM_STATE_INVALID);
+	return (vm->state != VM_STATE_INVALID);
 }
 
 bool is_sos_vm(const struct acrn_vm *vm)
 {
-	return (vm != NULL)  && (get_vm_config(vm->vm_id)->type == SOS_VM);
+	return (vm != NULL)  && (get_vm_config(vm->vm_id)->load_order == SOS_VM);
 }
 
 /**
  * @pre vm != NULL
  * @pre vm->vmid < CONFIG_MAX_VM_NUM
  */
-bool is_normal_vm(const struct acrn_vm *vm)
+bool is_postlaunched_vm(const struct acrn_vm *vm)
 {
-	return (get_vm_config(vm->vm_id)->type == NORMAL_VM);
+	return (get_vm_config(vm->vm_id)->load_order == POST_LAUNCHED_VM);
 }
 
 /**
@@ -75,7 +78,7 @@ bool is_prelaunched_vm(const struct acrn_vm *vm)
 	struct acrn_vm_config *vm_config;
 
 	vm_config = get_vm_config(vm->vm_id);
-	return (vm_config->type == PRE_LAUNCHED_VM);
+	return (vm_config->load_order == PRE_LAUNCHED_VM);
 }
 
 /**
@@ -190,7 +193,7 @@ static void prepare_prelaunched_vm_memmap(struct acrn_vm *vm, const struct acrn_
 /**
  * before boot sos_vm(service OS), call it to hide the HV RAM entry in e820 table from sos_vm
  *
- * @pre vm != NULL && entry != NULL && p_e820_mem != NULL
+ * @pre vm != NULL && entry != NULL
  */
 static void create_sos_vm_e820(struct acrn_vm *vm)
 {
@@ -201,14 +204,17 @@ static void create_sos_vm_e820(struct acrn_vm *vm)
 	uint64_t hv_end_pa  = hv_start_pa + CONFIG_HV_RAM_SIZE;
 	uint32_t entries_count = get_e820_entries_count();
 	struct e820_entry *entry, new_entry = {0};
-	struct e820_entry *p_e820 = (struct e820_entry *)get_e820_entry();
-	struct e820_mem_params *p_e820_mem = (struct e820_mem_params *)get_e820_mem_info();
+	const struct e820_mem_params *p_e820_mem_info = get_e820_mem_info();
+	struct acrn_vm_config *vm_config = get_vm_config(vm->vm_id);
 
 	/* hypervisor mem need be filter out from e820 table
 	 * it's hv itself + other hv reserved mem like vgt etc
 	 */
+	(void)memcpy_s((void *)sos_ve820, entries_count * sizeof(struct e820_entry),
+		(const void *)get_e820_entry(), entries_count * sizeof(struct e820_entry));
+
 	for (i = 0U; i < entries_count; i++) {
-		entry = p_e820 + i;
+		entry = &sos_ve820[i];
 		entry_start = entry->baseaddr;
 		entry_end = entry->baseaddr + entry->length;
 
@@ -250,16 +256,15 @@ static void create_sos_vm_e820(struct acrn_vm *vm)
 	if (new_entry.length > 0UL) {
 		entries_count++;
 		ASSERT(entries_count <= E820_MAX_ENTRIES, "e820 entry overflow");
-		entry = p_e820 + entries_count - 1;
+		entry = &sos_ve820[entries_count - 1U];
 		entry->baseaddr = new_entry.baseaddr;
 		entry->length = new_entry.length;
 		entry->type = new_entry.type;
 	}
 
-	p_e820_mem->total_mem_size -= CONFIG_HV_RAM_SIZE;
-
 	vm->e820_entry_num = entries_count;
-	vm->e820_entries = p_e820;
+	vm->e820_entries = sos_ve820;
+	vm_config->memory.size = p_e820_mem_info->total_mem_size - CONFIG_HV_RAM_SIZE;
 }
 
 /**
@@ -337,7 +342,7 @@ int32_t create_vm(uint16_t vm_id, struct acrn_vm_config *vm_config, struct acrn_
 	sanitize_pte((uint64_t *)vm->arch_vm.nworld_eptp);
 
 	/* Register default handlers for PIO & MMIO if it is SOS VM or Pre-launched VM */
-	if ((vm_config->type == SOS_VM) || (vm_config->type == PRE_LAUNCHED_VM)) {
+	if ((vm_config->load_order == SOS_VM) || (vm_config->load_order == PRE_LAUNCHED_VM)) {
 		register_pio_default_emulation_handler(vm);
 		register_mmio_default_emulation_handler(vm);
 	}
@@ -356,7 +361,7 @@ int32_t create_vm(uint16_t vm_id, struct acrn_vm_config *vm_config, struct acrn_
 		}
 
 	} else {
-		/* For PRE_LAUNCHED_VM and NORMAL_VM */
+		/* For PRE_LAUNCHED_VM and POST_LAUNCHED_VM */
 		if ((vm_config->guest_flags & GUEST_FLAG_SECURE_WORLD_ENABLED) != 0U) {
 			vm->sworld_control.flag.supported = 1U;
 		}
@@ -372,7 +377,7 @@ int32_t create_vm(uint16_t vm_id, struct acrn_vm_config *vm_config, struct acrn_
 			snprintf(vm_config->name, 16, "ACRN VM_%d", vm_id);
 		}
 
-		 if (vm_config->type == PRE_LAUNCHED_VM) {
+		 if (vm_config->load_order == PRE_LAUNCHED_VM) {
 			create_prelaunched_vm_e820(vm);
 			prepare_prelaunched_vm_memmap(vm, vm_config);
 			(void)firmware_init_vm_boot_info(vm);
@@ -422,7 +427,7 @@ int32_t create_vm(uint16_t vm_id, struct acrn_vm_config *vm_config, struct acrn_
 		/* Populate return VM handle */
 		*rtn_vm = vm;
 		vm->sw.io_shared_page = NULL;
-		if ((vm_config->type == NORMAL_VM) && (vm_config->guest_flags & GUEST_FLAG_IO_COMPLETION_POLLING) != 0U) {
+		if ((vm_config->load_order == POST_LAUNCHED_VM) && (vm_config->guest_flags & GUEST_FLAG_IO_COMPLETION_POLLING) != 0U) {
 			/* enable IO completion polling mode per its guest flags in vm_config. */
 			vm->sw.is_completion_polling = true;
 		}
@@ -479,9 +484,9 @@ int32_t shutdown_vm(struct acrn_vm *vm)
 		vm_config = get_vm_config(vm->vm_id);
 		vm_config->guest_flags &= ~DM_OWNED_GUEST_FLAG_MASK;
 
-		ptdev_release_all_entries(vm);
-
 		vpci_cleanup(vm);
+
+		ptdev_release_all_entries(vm);
 
 		/* Free iommu */
 		if (vm->iommu != NULL) {
@@ -671,8 +676,8 @@ void launch_vms(uint16_t pcpu_id)
 
 	for (vm_id = 0U; vm_id < CONFIG_MAX_VM_NUM; vm_id++) {
 		vm_config = get_vm_config(vm_id);
-		if ((vm_config->type == SOS_VM) || (vm_config->type == PRE_LAUNCHED_VM)) {
-			if (vm_config->type == SOS_VM) {
+		if ((vm_config->load_order == SOS_VM) || (vm_config->load_order == PRE_LAUNCHED_VM)) {
+			if (vm_config->load_order == SOS_VM) {
 				sos_vm_ptr = &vm_array[vm_id];
 			}
 

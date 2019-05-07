@@ -45,6 +45,7 @@
 #include "irq.h"
 #include "lpc.h"
 #include "sw_load.h"
+#include "log.h"
 
 #define CONF1_ADDR_PORT    0x0cf8
 #define CONF1_DATA_PORT    0x0cfc
@@ -1231,10 +1232,14 @@ init_pci(struct vmctx *ctx)
 					continue;
 				ops = pci_emul_finddev(fi->fi_name);
 				assert(ops != NULL);
+
+				pr_notice("pci init %s\r\n", fi->fi_name);
 				error = pci_emul_init(ctx, ops, bus, slot,
 				    func, fi);
-				if (error)
+				if (error) {
+					pr_err("pci %s init failed\n", fi->fi_name);
 					goto pci_emul_init_fail;
+				}
 				success_cnt++;
 			}
 		}
@@ -1406,6 +1411,8 @@ deinit_pci(struct vmctx *ctx)
 					continue;
 				ops = pci_emul_finddev(fi->fi_name);
 				assert(ops != NULL);
+
+				pr_notice("pci deinit %s\n", fi->fi_name);
 				pci_emul_deinit(ctx, ops, bus, slot,
 				    func, fi);
 			}
@@ -2388,6 +2395,25 @@ pci_emul_dior(struct vmctx *ctx, int vcpu, struct pci_vdev *dev, int baridx,
 	}
 
 	return value;
+}
+
+struct pci_vdev*
+pci_get_vdev_info(int slot)
+{
+	struct businfo *bi;
+	struct slotinfo *si;
+	struct pci_vdev *dev = NULL;
+
+	bi = pci_businfo[0];
+	assert(bi != NULL);
+
+	si = &bi->slotinfo[slot];
+	if (si != NULL)
+		dev = si->si_funcs[0].fi_devi;
+	else
+		fprintf(stderr, "slot=%d is empty!\n", slot);
+
+	return dev;
 }
 
 struct pci_vdev_ops pci_dummy = {

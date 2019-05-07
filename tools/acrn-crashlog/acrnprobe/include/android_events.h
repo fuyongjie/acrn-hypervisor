@@ -11,7 +11,12 @@ extern char *loop_dev;
 
 #define VMEVT_HANDLED 0
 #define VMEVT_DEFER -1
-#define VMEVT_MISSLOG -2
+
+struct vm_event_t {
+	char *vm_msg;
+	size_t vm_msg_len;
+	const struct vm_t *vm;
+};
 
 #define ANDROID_LOGS_DIR "/logs/"
 #define IGN_SPACES "%*[[[:space:]]*]"
@@ -34,7 +39,8 @@ extern char *loop_dev;
 #define ANDROID_TYPE_FMT "%[[A-Z0-9_:-]{3,16}]" IGN_SPACES
 #define ANDROID_LINE_REST_FMT "%[[^\n]*]" IGN_RESTS
 
-void refresh_vm_history(const struct sender_t *sender,
+void refresh_vm_history(struct sender_t *sender,
 			int (*fn)(const char*, size_t, const struct vm_t *));
-
+int android_event_analyze(const char *msg, size_t len, char **result,
+			size_t *rsize);
 #endif

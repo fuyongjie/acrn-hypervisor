@@ -11,6 +11,7 @@
 #include <ext2fs/ext2fs.h>
 #include "event_queue.h"
 #include "probeutils.h"
+#include "vmrecord.h"
 
 #define CONTENT_MAX 10
 #define EXPRESSION_MAX 5
@@ -24,6 +25,7 @@
 #define VM_EVENT_TYPE_MAX 20
 
 struct trigger_t {
+	int		id;
 	const char	*name;
 	size_t		name_len;
 	const char	*type;
@@ -33,6 +35,7 @@ struct trigger_t {
 };
 
 struct vm_t {
+	int		id;
 	const char	*name;
 	size_t		name_len;
 	const char	*channel;
@@ -45,10 +48,11 @@ struct vm_t {
 	ext2_filsys	datafs;
 	unsigned long	history_size[SENDER_MAX];
 	char		*history_data;
-	char		last_synced_line_key[SENDER_MAX][SHORT_KEY_LENGTH + 1];
+	char		last_evt_detected[SENDER_MAX][SHORT_KEY_LENGTH + 1];
 };
 
 struct log_t {
+	int		id;
 	const char	*name;
 	size_t		name_len;
 	const char	*type;
@@ -64,6 +68,7 @@ struct log_t {
 };
 
 struct crash_t {
+	int		id;
 	const char	*name;
 	size_t		name_len;
 	const char	*channel;
@@ -87,11 +92,11 @@ struct crash_t {
 	int wd;
 	int level;
 	struct crash_t *(*reclassify)(const struct crash_t *, const char*,
-					char**, size_t *, char**, size_t *,
 					char**, size_t *);
 };
 
 struct info_t {
+	int		id;
 	const char	*name;
 	size_t		name_len;
 	const char	*channel;
@@ -115,6 +120,7 @@ struct uptime_t {
 };
 
 struct sender_t {
+	int		id;
 	const char	*name;
 	size_t		name_len;
 	const char	*outdir;
@@ -130,7 +136,8 @@ struct sender_t {
 	struct uptime_t *uptime;
 
 	void (*send)(struct event_t *);
-	char		*log_vmrecordid;
+	struct vmrecord_t vmrecord;
+	size_t		outdir_blocks_size;
 	int		sw_updated; /* each sender has their own record */
 };
 
@@ -239,7 +246,6 @@ int load_conf(const char *path);
 struct trigger_t *get_trigger_by_name(const char *name);
 struct log_t *get_log_by_name(const char *name);
 struct vm_t *get_vm_by_name(const char *name);
-int sender_id(const struct sender_t *sender);
 struct sender_t *get_sender_by_name(const char *name);
 enum event_type_t get_conf_by_wd(int wd, void **private);
 struct crash_t *get_crash_by_wd(int wd);

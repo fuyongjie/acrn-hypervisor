@@ -3,11 +3,18 @@
  *
  * SPDX-License-Identifier: BSD-3-Clause
  */
-
-#include <hypervisor.h>
+#include <types.h>
+#include <rtl.h>
+#include <errno.h>
+#include <sprintf.h>
 #include <multiboot.h>
+#include <pgtable.h>
+#include <guest_memory.h>
 #include <zeropage.h>
 #include <seed.h>
+#include <mmu.h>
+#include <vm.h>
+#include <logmsg.h>
 
 #define ACRN_DBG_BOOT	6U
 
@@ -188,7 +195,7 @@ int32_t sbl_init_vm_boot_info(struct acrn_vm *vm)
 
 				struct acrn_vm_config *vm_config = get_vm_config(vm->vm_id);
 
-				if (vm_config->type == PRE_LAUNCHED_VM) {
+				if (vm_config->load_order == PRE_LAUNCHED_VM) {
 					vm->sw.kernel_info.kernel_load_addr = (void *)(MEM_1M * 16U);
 					vm->sw.linux_info.bootargs_src_addr = (void *)vm_config->os_config.bootargs;
 					vm->sw.linux_info.bootargs_size =

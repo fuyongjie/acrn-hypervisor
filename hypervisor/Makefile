@@ -44,6 +44,8 @@ ifeq ($(CONFIG_SDC),y)
 SCENARIO_NAME := sdc
 else ifeq ($(CONFIG_LOGICAL_PARTITION),y)
 SCENARIO_NAME := logical_partition
+else ifeq ($(CONFIG_INDUSTRY),y)
+SCENARIO_NAME := industry
 endif
 
 LD_IN_TOOL = scripts/genld.sh
@@ -225,6 +227,7 @@ C_SRCS += hw/pci.c
 C_SRCS += dm/vpic.c
 C_SRCS += dm/vrtc.c
 C_SRCS += dm/vioapic.c
+C_SRCS += dm/vuart.c
 C_SRCS += dm/io_req.c
 C_SRCS += dm/vpci/vdev.c
 C_SRCS += dm/vpci/vpci.c

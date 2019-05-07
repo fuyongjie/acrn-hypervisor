@@ -43,7 +43,6 @@ static int crashlog_check_space(void)
 {
 	struct sender_t *crashlog = get_sender_by_name("crashlog");
 	int quota;
-	size_t dsize;
 	int cfg_size;
 
 
@@ -57,18 +56,34 @@ static int crashlog_check_space(void)
 	if (!space_available(crashlog->outdir, quota))
 		return -1;
 
-	if (dir_size(crashlog->outdir, crashlog->outdir_len, &dsize) == -1) {
-		LOGE("failed to check outdir size\n");
-		return -1;
-	}
-
 	if (cfg_atoi(crashlog->foldersize, crashlog->foldersize_len,
 		     &cfg_size) == -1)
 		return -1;
 
-	if (dsize/MB >= (size_t)cfg_size)
+	if (crashlog->outdir_blocks_size/MB >= (size_t)cfg_size) {
+		LOGD("the total blocks size (%zu) meets the quota (%zu)\n",
+		     crashlog->outdir_blocks_size/MB, (size_t)cfg_size);
+		return -1;
+	}
+	return 0;
+}
+
+static int log_grows(char *dir, size_t len)
+{
+	size_t add;
+	struct sender_t *crashlog = get_sender_by_name("crashlog");
+
+	if (!crashlog)
 		return -1;
 
+	if (dir_blocks_size(dir, len, &add) == -1) {
+		LOGE("failed to check outdir size\n");
+		return -1;
+	}
+
+	add += 4 * KB;
+	crashlog->outdir_blocks_size += add;
+	LOGD("log size + %zu = %zu\n", add, crashlog->outdir_blocks_size);
 	return 0;
 }
 
@@ -312,9 +327,6 @@ static void crashlog_get_log(struct log_t *log, void *data)
 	char *des;
 	char *desdir = (char *)data;
 
-	if (crashlog_check_space() == -1)
-		return;
-
 	start = get_uptime();
 	if (is_ac_filefmt(log->path)) {
 		int i;
@@ -372,12 +384,11 @@ static void crashlog_get_log(struct log_t *log, void *data)
 }
 
 #ifdef HAVE_TELEMETRICS_CLIENT
-static void telemd_send_crash(struct event_t *e)
+static void telemd_send_crash(struct event_t *e, char *eventid)
 {
 	struct crash_t *crash;
 	struct log_t *log;
 	char *class;
-	char *eventid;
 	int id;
 	int ret;
 	struct telemd_data_t data = {
@@ -391,13 +402,6 @@ static void telemd_send_crash(struct event_t *e)
 	if (ret < 0) {
 		LOGE("compute string failed, out of memory\n");
 		return;
-	}
-
-	eventid = generate_event_id((const char *)class, ret, NULL, 0,
-		  KEY_LONG);
-	if (eventid == NULL) {
-		LOGE("generate eventid failed, error (%s)\n", strerror(errno));
-		goto free_class;
 	}
 
 	data.class = class;
@@ -415,7 +419,7 @@ static void telemd_send_crash(struct event_t *e)
 		ret = asprintf(&des, "%s/%s", e->dir, e->path);
 		if (ret < 0) {
 			LOGE("compute string failed, out of memory\n");
-			goto free_eventid;
+			goto free_class;
 		}
 
 		if (!file_exists(des)) {
@@ -427,7 +431,7 @@ static void telemd_send_crash(struct event_t *e)
 			if (ret < 0) {
 				LOGE("compute string failed, out of memory\n");
 				free(des);
-				goto free_eventid;
+				goto free_class;
 			}
 
 			LOGW("(%s) unavailable, try the original path (%s)\n",
@@ -447,18 +451,15 @@ static void telemd_send_crash(struct event_t *e)
 
 		free(des);
 	}
-free_eventid:
-	free(eventid);
 free_class:
 	free(class);
 }
 
-static void telemd_send_info(struct event_t *e)
+static void telemd_send_info(struct event_t *e, char *eventid)
 {
 	struct info_t *info;
 	struct log_t *log;
 	char *class;
-	char *eventid;
 	int id;
 	int ret;
 	struct telemd_data_t data = {
@@ -473,13 +474,6 @@ static void telemd_send_info(struct event_t *e)
 		return;
 	}
 
-	eventid = generate_event_id((const char *)class, ret, NULL, 0,
-		  KEY_LONG);
-	if (eventid == NULL) {
-		LOGE("generate eventid failed, error (%s)\n", strerror(errno));
-		goto free_class;
-	}
-
 	data.class = class;
 	data.eventid = eventid;
 
@@ -490,9 +484,6 @@ static void telemd_send_info(struct event_t *e)
 		log->get(log, (void *)&data);
 	}
 
-	free(eventid);
-
-free_class:
 	free(class);
 }
 
@@ -543,7 +534,7 @@ static void telemd_send_uptime(void)
 	}
 }
 
-static void telemd_send_reboot(void)
+static void telemd_send_reboot(char *eventid)
 {
 	struct sender_t *telemd = get_sender_by_name("telemd");
 	char *class;
@@ -582,48 +573,37 @@ static void telemd_send_reboot(void)
 		return;
 	}
 
-	telemd_send_data("reboot", NULL, INFO_SEVERITY, class);
+	telemd_send_data("reboot", eventid, INFO_SEVERITY, class);
 	free(class);
 }
 
-static int telemd_new_vmevent(const char *line_to_sync,
-				size_t len, const struct vm_t *vm)
+static void telemd_send_vmevent(struct event_t *e, char *eventid, char *data,
+				size_t dlen)
 {
-	char event[ANDROID_WORD_LEN];
-	char longtime[ANDROID_WORD_LEN];
-	char type[ANDROID_WORD_LEN];
-	char rest[PATH_MAX];
+	char *vmkey;
+	char *event;
+	char *type;
+	char *rest;
+	size_t klen;
+	size_t elen;
+	size_t tlen;
+	size_t rlen;
 	char *vmlogpath = NULL;
-	char vmkey[ANDROID_WORD_LEN];
-	char *log;
 	char *class;
-	char *eventid;
 	char *files[512];
 	int count;
 	int i;
 	uint32_t severity;
+	char *log;
 	int res;
-	int ret = VMEVT_HANDLED;
+	struct vm_event_t *vme;
 
-	/* VM events in history_event look like this:
-	 *
-	 * "CRASH   xxxxxxxxxxxxxxxxxxxx  2017-11-11/03:12:59  JAVACRASH
-	 * /data/logs/crashlog0_xxxxxxxxxxxxxxxxxxxx"
-	 * "REBOOT  xxxxxxxxxxxxxxxxxxxx  2011-11-11/11:20:51  POWER-ON
-	 * 0000:00:00"
-	 */
-	const char * const vm_format =
-		ANDROID_ENEVT_FMT ANDROID_KEY_FMT ANDROID_LONGTIME_FMT
-		ANDROID_TYPE_FMT ANDROID_LINE_REST_FMT;
-
-	res = str_split_ere(line_to_sync, len, vm_format, strlen(vm_format),
-			    event, sizeof(event), vmkey, sizeof(vmkey),
-			    longtime, sizeof(longtime),
-			    type, sizeof(type), rest, sizeof(rest));
-	if (res != 5) {
-		LOGE("get an invalid line from (%s), skip\n", vm->name);
-		return VMEVT_HANDLED;
-	}
+	vmkey = strings_ind(data, dlen, 0, &klen);
+	event = strings_ind(data, dlen, 1, &elen);
+	type = strings_ind(data, dlen, 2, &tlen);
+	rest = strings_ind(data, dlen, 3, &rlen);
+	if (!vmkey || !event || !type || !rest)
+		return;
 
 	if (strcmp(event, "CRASH") == 0)
 		severity = CRASH_SEVERITY;
@@ -633,47 +613,26 @@ static int telemd_new_vmevent(const char *line_to_sync,
 	/* if line contains log, fill vmlogpath */
 	log = strstr(rest, ANDROID_LOGS_DIR);
 	if (log) {
-		struct sender_t *crashlog = get_sender_by_name("crashlog");
 		const char *logf;
-		size_t logflen;
-		int res;
 
-		if (!crashlog)
-			return VMEVT_HANDLED;
-
+		if (!e->dir)
+			return;
 		logf = log + sizeof(ANDROID_LOGS_DIR) - 1;
-		logflen = &rest[0] + strnlen(rest, PATH_MAX) - logf;
-		res = find_file(crashlog->outdir, crashlog->outdir_len, logf,
-				logflen, 1, &vmlogpath, 1);
-		if (res == -1) {
-			LOGE("failed to find (%s) in (%s)\n",
-			     logf, crashlog->outdir);
-			return VMEVT_DEFER;
-		} else if (res == 0)
-			return VMEVT_DEFER;
+		if (asprintf(&vmlogpath, "%s/%s", e->dir, logf) == -1)
+			return;
 	}
 
-	res = asprintf(&class, "%s/%s/%s", vm->name, event, type);
+	vme = (struct vm_event_t *)e->private;
+	res = asprintf(&class, "%s/%s/%s", vme->vm->name, event, type);
 	if (res < 0) {
 		LOGE("compute string failed, out of memory\n");
-		ret = VMEVT_DEFER;
 		goto free_vmlogpath;
 	}
 
-	eventid = generate_event_id((const char *)class, res, NULL, 0,
-		  KEY_LONG);
-	if (eventid == NULL) {
-		LOGE("generate eventid failed, error (%s)\n", strerror(errno));
-		ret = VMEVT_DEFER;
-		goto free_class;
-	}
-
 	if (!vmlogpath) {
-		res = telemd_send_data("no logs", eventid, severity, class);
-		if (res == -1)
-			ret = VMEVT_DEFER;
-
-		goto free;
+		telemd_send_data("vm event doesn't contain logs", eventid,
+				 severity, class);
+		goto free_class;
 	}
 
 	/* send logs */
@@ -682,54 +641,111 @@ static int telemd_new_vmevent(const char *line_to_sync,
 		for (i = 0; i < count; i++) {
 			if (!strstr(files[i], "/.") &&
 			    !strstr(files[i], "/..")) {
-				res = telemd_send_data(files[i], eventid,
-						       severity, class);
-				if (res == -1)
-					ret = VMEVT_DEFER;
+				telemd_send_data(files[i], eventid, severity,
+						 class);
 			}
-		}
-	} else if (count == 2) {
-		char *content;
-
-		res = asprintf(&content, "no logs under (%s)", vmlogpath);
-		if (res > 0) {
-			res = telemd_send_data(content, eventid, severity,
-					       class);
-			if (res == -1)
-				ret = VMEVT_DEFER;
-			free(content);
-		} else {
-			LOGE("compute string failed, out of memory\n");
-			ret = VMEVT_DEFER;
 		}
 	} else if (count < 0) {
 		LOGE("lsdir (%s) failed, error (%s)\n", vmlogpath,
 		     strerror(-count));
-		ret = VMEVT_DEFER;
 	} else {
 		LOGE("get (%d) files in (%s) ???\n", count, vmlogpath);
-		ret = VMEVT_DEFER;
 	}
 
 	while (count > 0)
 		free(files[--count]);
 
-free:
-	free(eventid);
 free_class:
 	free(class);
 free_vmlogpath:
 	if (vmlogpath)
 		free(vmlogpath);
 
-	return ret;
+	return;
+}
+
+static int telemd_new_event(struct event_t *e, char *result, size_t rsize,
+				char **eid)
+{
+	struct crash_t *crash;
+	struct info_t *info;
+	struct vm_event_t *vme;
+	char *key;
+	const char *e_subtype = NULL;
+	size_t e_subtype_len = 0;
+	const char *estr = etype_str[e->event_type];
+	size_t eslen = strlen(etype_str[e->event_type]);
+
+	switch (e->event_type) {
+	case CRASH:
+		crash = (struct crash_t *)e->private;
+		e_subtype = crash->name;
+		e_subtype_len = crash->name_len;
+		break;
+	case INFO:
+		info = (struct info_t *)e->private;
+		e_subtype = info->name;
+		e_subtype_len = info->name_len;
+		break;
+	case UPTIME:
+		return 0;
+	case REBOOT:
+		break;
+	case VM:
+		vme = (struct vm_event_t *)e->private;
+		estr = vme->vm->name;
+		eslen = vme->vm->name_len;
+		e_subtype = strings_ind(result, rsize, 2, &e_subtype_len);
+		if (!e_subtype)
+			return -1;
+		break;
+	default:
+		break;
+	}
+
+	key = generate_event_id(estr, eslen, e_subtype, e_subtype_len,
+				KEY_LONG);
+	if (!key) {
+		LOGE("failed to generate event id, %s\n", strerror(errno));
+		return -1;
+	}
+	*eid = key;
+	return 0;
+}
+
+static int telemd_event_analyze(struct event_t *e, char **result,
+				size_t *rsize)
+{
+	if (e->event_type == VM) {
+		struct vm_event_t *vme = (struct vm_event_t *)e->private;
+
+		if (android_event_analyze(vme->vm_msg, vme->vm_msg_len,
+					  result, rsize) == -1) {
+			LOGE("failed to analyze android event\n");
+			return -1;
+		}
+	}
+	return 0;
 }
 
 static void telemd_send(struct event_t *e)
 {
 	int id;
 	struct log_t *log;
+	size_t rsize;
+	char *result = NULL;
+	char *eid = NULL;
 
+	if (telemd_event_analyze(e, &result, &rsize) == -1) {
+		LOGE("failed to analyze event\n");
+		return;
+	}
+	if (telemd_new_event(e, result, rsize, &eid) == -1) {
+		LOGE("failed to request resouce\n");
+		if (result)
+			free(result);
+		return;
+	}
 	for_each_log(id, log, conf) {
 		if (!log)
 			continue;
@@ -739,95 +755,64 @@ static void telemd_send(struct event_t *e)
 
 	switch (e->event_type) {
 	case CRASH:
-		telemd_send_crash(e);
+		telemd_send_crash(e, eid);
 		break;
 	case INFO:
-		telemd_send_info(e);
+		telemd_send_info(e, eid);
 		break;
 	case UPTIME:
 		telemd_send_uptime();
 		break;
 	case REBOOT:
-		telemd_send_reboot();
+		telemd_send_reboot(eid);
 		break;
 	case VM:
-		refresh_vm_history(get_sender_by_name("telemd"),
-				   telemd_new_vmevent);
+		telemd_send_vmevent(e, eid, result, rsize);
 		break;
 	default:
 		LOGE("unsupoorted event type %d\n", e->event_type);
 	}
+	if (eid)
+		free(eid);
+	if (result)
+		free(result);
 }
 #endif
 
-static void crashlog_send_crash(struct event_t *e)
+static void crashlog_send_crash(struct event_t *e, char *eid,
+				char *data, size_t dlen)
 {
-	struct crash_t *crash;
-	char *key;
 	char *data0;
 	char *data1;
 	char *data2;
 	size_t d0len;
 	size_t d1len;
 	size_t d2len;
-	char *trfile = NULL;
-	struct crash_t *rcrash = (struct crash_t *)e->private;
+	struct crash_t *crash = (struct crash_t *)e->private;
+	int id;
+	struct log_t *log;
 
-	if (!strcmp(rcrash->trigger->type, "dir")) {
-		if (asprintf(&trfile, "%s/%s", rcrash->trigger->path,
-			     e->path) == -1) {
-			LOGE("out of memory\n");
-			return;
-		}
-	}
-
-	crash = rcrash->reclassify(rcrash, trfile, &data0, &d0len, &data1,
-				   &d1len, &data2, &d2len);
-	if (trfile)
-		free(trfile);
-	if (crash == NULL) {
-		LOGE("failed to reclassify rcrash (%s)\n", rcrash->name);
+	hist_raise_event(etype_str[e->event_type], crash->name, e->dir, "",
+			 eid);
+	if (!e->dir)
 		return;
+
+	data0 = strings_ind(data, dlen, 0, &d0len);
+	data1 = strings_ind(data, dlen, 1, &d1len);
+	data2 = strings_ind(data, dlen, 2, &d2len);
+	if (!data1 || !data1 || !data2)
+		return;
+
+	generate_crashfile(e->dir, etype_str[e->event_type],
+			   strlen(etype_str[e->event_type]), eid,
+			   SHORT_KEY_LENGTH, crash->name, crash->name_len,
+			   data0, d0len, data1, d1len, data2, d2len);
+
+	for_each_log_collect(id, log, crash) {
+		if (!log)
+			continue;
+		log->get(log, (void *)e->dir);
 	}
-	/* change the class for other senders */
-	e->private = (void *)crash;
-
-	key = generate_event_id("CRASH", 5, (const char *)crash->name,
-				crash->name_len, KEY_SHORT);
-	if (key == NULL) {
-		LOGE("failed to generate event id, error (%s)\n",
-		     strerror(errno));
-		goto free_data;
-	}
-
-	/* check space before collecting logs */
-	if (crashlog_check_space() == -1) {
-		hist_raise_event("CRASH", crash->name, "SPACE_FULL", "", key);
-		goto free_key;
-	}
-
-	if (to_collect_logs(crash) || !strcmp(e->channel, "inotify")) {
-		struct log_t *log;
-		int id;
-
-		e->dir = generate_log_dir(MODE_CRASH, key);
-		if (e->dir == NULL) {
-			LOGE("failed to generate crashlog dir\n");
-			goto free_key;
-		}
-
-		generate_crashfile(e->dir, "CRASH", 5, key, SHORT_KEY_LENGTH,
-				   crash->name, crash->name_len,
-				   data0, d0len, data1, d1len, data2, d2len);
-		for_each_log_collect(id, log, crash) {
-			if (!log)
-				continue;
-
-			log->get(log, (void *)e->dir);
-		}
-
-	}
-
 	if (!strcmp(e->channel, "inotify")) {
 		/* get the trigger file */
 		char *src;
@@ -835,14 +820,14 @@ static void crashlog_send_crash(struct event_t *e)
 
 		if (asprintf(&des, "%s/%s", e->dir, e->path) == -1) {
 			LOGE("out of memory\n");
-			goto free_key;
+			return;
 		}
 
 		if (asprintf(&src, "%s/%s", crash->trigger->path,
 			     e->path) == -1) {
 			LOGE("out of memory\n");
 			free(des);
-			goto free_key;
+			return;
 		}
 
 		if (do_copy_tail(src, des, 0) < 0)
@@ -851,59 +836,22 @@ static void crashlog_send_crash(struct event_t *e)
 		free(src);
 		free(des);
 	}
-
-	hist_raise_event("CRASH", crash->name, e->dir, "", key);
-
-free_key:
-	free(key);
-free_data:
-	if (data0)
-		free(data0);
-	if (data1)
-		free(data1);
-	if (data2)
-		free(data2);
 }
 
-static void crashlog_send_info(struct event_t *e)
+static void crashlog_send_info(struct event_t *e, char *eid)
 {
 	int id;
 	struct info_t *info = (struct info_t *)e->private;
 	struct log_t *log;
-	char *key = generate_event_id("INFO", 4, (const char *)info->name,
-				      info->name_len, KEY_SHORT);
 
-	if (key == NULL) {
-		LOGE("generate event id failed, error (%s)\n",
-		     strerror(errno));
+	hist_raise_event(etype_str[e->event_type], info->name, e->dir, "", eid);
+	if (!e->dir)
 		return;
+	for_each_log_collect(id, log, info) {
+		if (!log)
+			continue;
+		log->get(log, (void *)e->dir);
 	}
-
-	if (to_collect_logs(info)) {
-		/* check space before collecting logs */
-		if (crashlog_check_space() == -1) {
-			hist_raise_event("INFO", info->name, "SPACE_FULL", "",
-					 key);
-			goto free_key;
-		}
-
-		e->dir = generate_log_dir(MODE_STATS, key);
-		if (e->dir == NULL) {
-			LOGE("generate crashlog dir failed\n");
-			goto free_key;
-		}
-
-		for_each_log_collect(id, log, info) {
-			if (!log)
-				continue;
-			log->get(log, (void *)e->dir);
-		}
-	}
-
-	hist_raise_event("INFO", info->name, e->dir, "", key);
-
-free_key:
-	free(key);
 }
 
 static void crashlog_send_uptime(void)
@@ -911,7 +859,7 @@ static void crashlog_send_uptime(void)
 	hist_raise_uptime(NULL);
 }
 
-static void crashlog_send_reboot(void)
+static void crashlog_send_reboot(struct event_t *e, char *eid)
 {
 	char reason[REBOOT_REASON_SIZE];
 	char *key;
@@ -934,117 +882,219 @@ static void crashlog_send_reboot(void)
 	}
 
 	read_startupreason(reason, sizeof(reason));
-	key = generate_event_id("REBOOT", 6, (const char *)reason,
-				strnlen(reason, REBOOT_REASON_SIZE), KEY_SHORT);
-	if (key == NULL) {
-		LOGE("generate event id failed, error (%s)\n",
-		     strerror(errno));
-		return;
-	}
-
-	hist_raise_event("REBOOT", reason, NULL, "", key);
-	free(key);
+	hist_raise_event(etype_str[e->event_type], reason, NULL, "", eid);
 }
 
-static int crashlog_new_vmevent(const char *line_to_sync,
-				size_t len, const struct vm_t *vm)
+static void crashlog_send_vmevent(struct event_t *e, char *eid,
+				char *data, size_t dlen)
 {
-	char event[ANDROID_WORD_LEN];
-	char longtime[ANDROID_WORD_LEN];
-	char type[ANDROID_WORD_LEN];
-	char rest[PATH_MAX];
-	char vmkey[ANDROID_WORD_LEN];
-	char *vmlogpath = NULL;
-	char *key;
+	char *vmkey;
+	char *event;
+	char *type;
+	char *rest;
+	size_t klen;
+	size_t elen;
+	size_t tlen;
+	size_t rlen;
+	char *vmlogpath;
 	char *log;
-	int ret = VMEVT_HANDLED;
 	int res;
 	int cnt;
-	char *dir;
+	ext2_filsys datafs;
+	struct sender_t *crashlog = get_sender_by_name("crashlog");
+	struct vm_event_t *vme = (struct vm_event_t *)e->private;
+	enum vmrecord_mark_t mark = SUCCESS;
 
-	/* VM events in history_event like this:
-	 *
-	 * "CRASH   xxxxxxxxxxxxxxxxxxxx  2017-11-11/03:12:59  JAVACRASH
-	 * /data/logs/crashlog0_xxxxxxxxxxxxxxxxxxxx"
-	 * "REBOOT  xxxxxxxxxxxxxxxxxxxx  2011-11-11/11:20:51  POWER-ON
-	 * 0000:00:00"
-	 */
-	const char * const vm_format =
-		ANDROID_ENEVT_FMT ANDROID_KEY_FMT ANDROID_LONGTIME_FMT
-		ANDROID_TYPE_FMT ANDROID_LINE_REST_FMT;
+	if (!crashlog)
+		return;
 
-	res = str_split_ere(line_to_sync, len, vm_format, strlen(vm_format),
-			    event, sizeof(event), vmkey, sizeof(vmkey),
-			    longtime, sizeof(longtime),
-			    type, sizeof(type), rest, sizeof(rest));
-	if (res != 5) {
-		LOGE("get an invalid line from (%s), skip\n", vm->name);
-		return ret;
+	vmkey = strings_ind(data, dlen, 0, &klen);
+	event = strings_ind(data, dlen, 1, &elen);
+	type = strings_ind(data, dlen, 2, &tlen);
+	rest = strings_ind(data, dlen, 3, &rlen);
+	if (!vmkey || !event || !type || !rest)
+		return;
+
+	hist_raise_event(vme->vm->name, type, e->dir, "", eid);
+
+	if (!e->dir)
+		goto mark_record;
+
+	generate_crashfile(e->dir, event, elen, eid, SHORT_KEY_LENGTH, type,
+			   tlen, vme->vm->name, vme->vm->name_len, vmkey, klen,
+			   NULL, 0);
+
+	log = strstr(rest, ANDROID_LOGS_DIR);
+	if (!log)
+		goto mark_record;
+
+	/* if line contains log, we need dump each file in the logdir */
+	vmlogpath = log + 1;
+
+	if (e2fs_open(loop_dev, &datafs) == -1) {
+		mark = WAITING_SYNC;
+		goto mark_record;
 	}
 
-	key = generate_event_id("SOS", 3, (const char *)vmkey,
-				strnlen(vmkey, ANDROID_WORD_LEN), KEY_SHORT);
-	if (key == NULL) {
-		LOGE("generate event id failed, error (%s)\n",
-		     strerror(errno));
-		return VMEVT_DEFER;
+	res = e2fs_dump_dir_by_dpath(datafs, vmlogpath, e->dir, &cnt);
+	e2fs_close(datafs);
+	if (res == -1) {
+		if (cnt) {
+			LOGE("dump (%s) abort at (%d)\n", vmlogpath, cnt);
+			mark = WAITING_SYNC;
+		} else {
+			LOGW("(%s) doesn't exsit\n", vmlogpath);
+			mark = MISS_LOG;
+		}
+	}
+	if (cnt == 1) {
+		LOGW("%s is empty, will sync it in the next loop\n", vmlogpath);
+		mark = WAITING_SYNC;
+	}
+	if (res == -1 || cnt == -1) {
+		if (remove_r(e->dir) == -1)
+			LOGE("failed to remove %s, %s\n", e->dir,
+			     strerror(errno));
+		free(e->dir);
+		e->dir = NULL;
+	}
+
+mark_record:
+	vmrecord_open_mark(&crashlog->vmrecord, vmkey, klen, mark);
+	return;
+}
+
+static int crashlog_event_analyze(struct event_t *e, char **result,
+				size_t *rsize)
+{
+	struct crash_t *rcrash;
+	struct crash_t *crash;
+	char *trfile = NULL;
+	struct vm_event_t *vme;
+
+	switch (e->event_type) {
+	case CRASH:
+		rcrash = (struct crash_t *)e->private;
+		if (!strcmp(rcrash->trigger->type, "dir")) {
+			if (asprintf(&trfile, "%s/%s", rcrash->trigger->path,
+				     e->path) == -1) {
+				LOGE("failed to asprintf\n");
+				return -1;
+			}
+		}
+		crash = rcrash->reclassify(rcrash, trfile, result, rsize);
+		if (trfile)
+			free(trfile);
+		if (!crash) {
+			LOGE("failed to reclassify (%s)\n", rcrash->name);
+			return -1;
+		}
+		/* change the class */
+		e->private = (void *)crash;
+		break;
+	case VM:
+		vme = (struct vm_event_t *)e->private;
+		if (android_event_analyze(vme->vm_msg, vme->vm_msg_len,
+					  result, rsize) == -1) {
+			LOGE("failed to analyze android event\n");
+			return -1;
+		}
+		break;
+	default:
+		break;
+	}
+	return 0;
+}
+
+static int crashlog_new_event(struct event_t *e, char *result, size_t rsize,
+				char **eid)
+{
+	char *key;
+	const char *e_subtype = NULL;
+	size_t e_subtype_len = 0;
+	struct crash_t *crash;
+	struct info_t *info;
+	struct vm_event_t *vme;
+	enum e_dir_mode mode;
+	int need_logs = 0;
+	struct sender_t *crashlog;
+	char *vmkey;
+	size_t vklen;
+	const char *estr = etype_str[e->event_type];
+	size_t eslen = strlen(etype_str[e->event_type]);
+
+	switch (e->event_type) {
+	case CRASH:
+		crash = (struct crash_t *)e->private;
+		e_subtype = crash->name;
+		e_subtype_len = crash->name_len;
+		if (to_collect_logs(crash) || !strcmp(e->channel, "inotify")) {
+			need_logs = 1;
+			mode = MODE_CRASH;
+		}
+		break;
+	case INFO:
+		info = (struct info_t *)e->private;
+		e_subtype = info->name;
+		e_subtype_len = info->name_len;
+		if (to_collect_logs(info) || !strcmp(e->channel, "inotify")) {
+			need_logs = 1;
+			mode = MODE_STATS;
+		}
+		break;
+	case UPTIME:
+		return 0;
+	case REBOOT:
+		break;
+	case VM:
+		vme = (struct vm_event_t *)e->private;
+		estr = vme->vm->name;
+		eslen = vme->vm->name_len;
+		e_subtype = strings_ind(result, rsize, 2, &e_subtype_len);
+		if (!e_subtype)
+			return -1;
+		need_logs = 1;
+		mode = MODE_VMEVENT;
+		break;
+	default:
+		break;
+	}
+
+	key = generate_event_id(estr, eslen, e_subtype, e_subtype_len,
+				KEY_SHORT);
+	if (!key) {
+		LOGE("failed to generate event id, %s\n", strerror(errno));
+		goto fail;
+	}
+
+	if (!need_logs) {
+		*eid = key;
+		return 0;
 	}
 
 	if (crashlog_check_space() == -1) {
-		hist_raise_event(vm->name, type, "SPACE_FULL", "", key);
-		goto free_key;
+		hist_raise_event(estr, e_subtype, "SPACE_FULL", "", key);
+		free(key);
+		goto fail;
 	}
 
-	dir = generate_log_dir(MODE_VMEVENT, key);
-	if (dir == NULL) {
-		LOGE("generate crashlog dir failed\n");
-		ret = VMEVT_DEFER;
-		goto free_key;
+	e->dir = generate_log_dir(mode, key, &e->dlen);
+	if (!e->dir) {
+		LOGE("failed to generate crashlog dir\n");
+		free(key);
+		goto fail;
 	}
-
-	generate_crashfile(dir, event, strnlen(event, ANDROID_WORD_LEN),
-			   key, SHORT_KEY_LENGTH,
-			   type, strnlen(type, ANDROID_WORD_LEN),
-			   vm->name, vm->name_len,
-			   vmkey, strnlen(vmkey, ANDROID_WORD_LEN), NULL, 0);
-
-	/* if line contains log, we need dump each file in the logdir
-	 */
-	log = strstr(rest, "/logs/");
-	if (log) {
-		vmlogpath = log + 1;
-		res = e2fs_dump_dir_by_dpath(vm->datafs, vmlogpath, dir, &cnt);
-		if (res == -1) {
-			if (cnt) {
-				LOGE("dump (%s) abort at (%d)\n", vmlogpath,
-				     cnt);
-				ret = VMEVT_DEFER;
-			} else {
-				LOGW("(%s) is missing\n", vmlogpath);
-				ret = VMEVT_MISSLOG; /* missing logdir */
-			}
-			if (remove_r(dir) == -1)
-				LOGE("failed to remove %s (%d)\n", dir, -errno);
-			goto free_dir;
-		}
-		if (cnt == 1) {
-			LOGW("(%s) is empty, will sync it in the next loop\n",
-			     vmlogpath);
-			ret = VMEVT_DEFER;
-			if (remove_r(dir) == -1)
-				LOGE("failed to remove %s (%d)\n", dir, -errno);
-			goto free_dir;
-		}
+	*eid = key;
+	return 0;
+fail:
+	if (e->event_type == VM) {
+		crashlog = get_sender_by_name("crashlog");
+		vmkey = strings_ind(result, rsize, 0, &vklen);
+		if (!crashlog || !vmkey)
+			return -1;
+		vmrecord_open_mark(&crashlog->vmrecord, vmkey, vklen, NO_RESRC);
 	}
-
-	hist_raise_event(vm->name, type, dir, "", key);
-
-free_dir:
-	free(dir);
-free_key:
-	free(key);
-
-	return ret;
+	return -1;
 }
 
 static void crashlog_send(struct event_t *e)
@@ -1052,7 +1102,20 @@ static void crashlog_send(struct event_t *e)
 
 	int id;
 	struct log_t *log;
+	size_t rsize = 0;
+	char *result = NULL;
+	char *eid = NULL;
 
+	if (crashlog_event_analyze(e, &result, &rsize) == -1) {
+		LOGE("failed to analyze event\n");
+		return;
+	}
+	if (crashlog_new_event(e, result, rsize, &eid) == -1) {
+		LOGE("failed to request resouce\n");
+		if (result)
+			free(result);
+		return;
+	}
 	for_each_log(id, log, conf) {
 		if (!log)
 			continue;
@@ -1061,29 +1124,33 @@ static void crashlog_send(struct event_t *e)
 	}
 	switch (e->event_type) {
 	case CRASH:
-		crashlog_send_crash(e);
+		crashlog_send_crash(e, eid, result, rsize);
 		break;
 	case INFO:
-		crashlog_send_info(e);
+		crashlog_send_info(e, eid);
 		break;
 	case UPTIME:
 		crashlog_send_uptime();
 		break;
 	case REBOOT:
-		crashlog_send_reboot();
+		crashlog_send_reboot(e, eid);
 		break;
 	case VM:
-		refresh_vm_history(get_sender_by_name("crashlog"),
-				   crashlog_new_vmevent);
+		crashlog_send_vmevent(e, eid, result, rsize);
 		break;
 	default:
 		LOGE("unsupoorted event type %d\n", e->event_type);
 	}
+	if (e->dir)
+		log_grows(e->dir, e->dlen);
+	if (eid)
+		free(eid);
+	if (result)
+		free(result);
 }
 
 int init_sender(void)
 {
-	int ret;
 	int id;
 	int fd;
 	struct sender_t *sender;
@@ -1093,24 +1160,16 @@ int init_sender(void)
 		if (!sender)
 			continue;
 
-		ret = asprintf(&sender->log_vmrecordid, "%s/VM_eventsID.log",
-			       sender->outdir);
-		if (ret < 0) {
-			LOGE("compute string failed, out of memory\n");
-			return -ENOMEM;
-		}
-
 		if (!directory_exists(sender->outdir))
 			if (mkdir_p(sender->outdir) < 0) {
 				LOGE("mkdir (%s) failed, error (%s)\n",
 				     sender->outdir, strerror(errno));
-				return -errno;
+				return -1;
 			}
 
-		ret = init_properties(sender);
-		if (ret) {
+		if (init_properties(sender)) {
 			LOGE("init sender failed\n");
-			exit(-1);
+			return -1;
 		}
 
 		/* touch uptime file, to add inotify */
@@ -1120,16 +1179,29 @@ int init_sender(void)
 			if (fd < 0) {
 				LOGE("failed to open (%s), error (%s)\n",
 				     uptime->path, strerror(errno));
-				return -errno;
+				return -1;
 			}
 			close(fd);
 		}
 
 		if (!strcmp(sender->name, "crashlog")) {
 			sender->send = crashlog_send;
-			ret = prepare_history();
-			if (ret)
+			if (prepare_history())
 				return -1;
+			if (asprintf(&sender->vmrecord.path,
+				     "%s/VM_eventsID.log",
+				       sender->outdir) == -1) {
+				LOGE("failed to asprintf\n");
+				return -1;
+			}
+			pthread_mutex_init(&sender->vmrecord.mtx, NULL);
+			if (dir_blocks_size(sender->outdir, sender->outdir_len,
+					    &sender->outdir_blocks_size)
+			    == -1) {
+				LOGE("failed to init outdir size\n");
+				return -1;
+			}
+
 #ifdef HAVE_TELEMETRICS_CLIENT
 		} else if (!strcmp(sender->name, "telemd")) {
 			sender->send = telemd_send;

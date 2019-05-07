@@ -20,6 +20,7 @@ CFLAGS += -Werror
 CFLAGS += -O2 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 CFLAGS += -Wformat -Wformat-security -fno-strict-aliasing
 CFLAGS += -fpie
+CFLAGS += -Wno-stringop-truncation -Wno-address-of-packed-member
 
 CFLAGS += -I$(BASEDIR)/include
 CFLAGS += -I$(BASEDIR)/include/public
@@ -152,6 +153,10 @@ SRCS += arch/x86/pm.c
 # vmcfg
 SRCS += vmcfg/vmcfg.c
 SRCS += vmcfg/apl-mrb/vm1/vm1.c
+
+# log
+SRCS += log/log.c
+SRCS += log/kmsg_logger.c
 
 OBJS := $(patsubst %.c,$(DM_OBJDIR)/%.o,$(SRCS))
 

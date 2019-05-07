@@ -118,7 +118,7 @@ static bool pci_cfgdata_io_read(struct acrn_vm *vm, struct acrn_vcpu *vcpu, uint
 		if (vpci_is_valid_access(pi->cached_reg + offset, bytes)) {
 			vm_config = get_vm_config(vm->vm_id);
 
-			switch (vm_config->type) {
+			switch (vm_config->load_order) {
 			case PRE_LAUNCHED_VM:
 				partition_mode_cfgread(vpci, pi->cached_bdf, pi->cached_reg + offset, bytes, &val);
 				break;
@@ -157,7 +157,7 @@ static bool pci_cfgdata_io_write(struct acrn_vm *vm, uint16_t addr, size_t bytes
 		if (vpci_is_valid_access(pi->cached_reg + offset, bytes)) {
 			vm_config = get_vm_config(vm->vm_id);
 
-			switch (vm_config->type) {
+			switch (vm_config->load_order) {
 			case PRE_LAUNCHED_VM:
 				partition_mode_cfgwrite(vpci, pi->cached_bdf, pi->cached_reg + offset, bytes, val);
 				break;
@@ -203,7 +203,7 @@ void vpci_init(struct acrn_vm *vm)
 	vpci->vm = vm;
 
 	vm_config = get_vm_config(vm->vm_id);
-	switch (vm_config->type) {
+	switch (vm_config->load_order) {
 	case PRE_LAUNCHED_VM:
 		ret = partition_mode_vpci_init(vm);
 		break;
@@ -241,7 +241,7 @@ void vpci_cleanup(const struct acrn_vm *vm)
 	struct acrn_vm_config *vm_config;
 
 	vm_config = get_vm_config(vm->vm_id);
-	switch (vm_config->type) {
+	switch (vm_config->load_order) {
 	case PRE_LAUNCHED_VM:
 		partition_mode_vpci_deinit(vm);
 		break;
@@ -250,8 +250,12 @@ void vpci_cleanup(const struct acrn_vm *vm)
 		sharing_mode_vpci_deinit(vm);
 		break;
 
+	case POST_LAUNCHED_VM:
+		post_launched_vm_vpci_deinit(vm);
+		break;
+
 	default:
-		/* Nothing to do for other vm types */
+		/* Unsupported VM type - Do nothing */
 		break;
 	}
 }
@@ -592,6 +596,52 @@ void sharing_mode_vpci_deinit(const struct acrn_vm *vm)
 		vmsi_deinit(vdev);
 
 		vmsix_deinit(vdev);
+	}
+}
+
+/**
+ * @pre vm != NULL
+ * @pre vm->vpci.pci_vdev_cnt <= CONFIG_MAX_PCI_DEV_NUM
+ * @pre is_postlaunched_vm(vm) == true
+ */
+void post_launched_vm_vpci_deinit(const struct acrn_vm *vm)
+{
+	struct acrn_vm *sos_vm;
+	uint32_t i;
+	struct pci_vdev *vdev;
+	int32_t ret;
+	/* PCI resources
+	 * 1) IOMMU domain switch
+	 * 2) Relese UOS MSI host IRQ/IRTE
+	 * 3) Update vdev info in SOS vdev
+	 * Cleanup mentioned above is  taken care when DM releases UOS resources
+	 * during a UOS reboot or shutdown
+	 * In the following cases, where DM does not get chance to cleanup
+	 * 1) DM crash/segfault
+	 * 2) SOS triple fault/hang
+	 * 3) SOS reboot before shutting down POST_LAUNCHED_VMs
+	 * ACRN must cleanup
+	 */
+	sos_vm = get_sos_vm();
+	for (i = 0U; i < sos_vm->vpci.pci_vdev_cnt; i++) {
+		vdev = (struct pci_vdev *)&(sos_vm->vpci.pci_vdevs[i]);
+
+		if (vdev->vpci->vm == vm) {
+			ret = move_pt_device(vm->iommu, sos_vm->iommu, (uint8_t)vdev->pdev->bdf.bits.b,
+					(uint8_t)(vdev->pdev->bdf.value & 0xFFU));
+			if (ret != 0) {
+				panic("failed to assign iommu device!");
+			}
+
+			vmsi_deinit(vdev);
+
+			vmsix_deinit(vdev);
+
+			/* Move vdev pointers back to SOS*/
+			vdev->vpci = (struct acrn_vpci *) &sos_vm->vpci;
+			/* vbdf equals to pbdf in sos */
+			vdev->vbdf.value = vdev->pdev->bdf.value;
+		}
 	}
 }
 

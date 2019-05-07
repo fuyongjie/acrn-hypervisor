@@ -8,34 +8,19 @@ config SDC
 	bool "Software Defined Cockpit"
 	help
 	  SDC (Software Defined Cockpit) is a typical scenario that ACRN supported.
-	  SDC will have one pre-launched SOS VM and one post-launched NORMAL VM.
+	  SDC will have one pre-launched SOS VM and one post-launched VM.
 
 config LOGICAL_PARTITION
 	bool "Logical Partition VMs"
 	help
 	  This scenario will run two pre-launched VMs.
 
-endchoice
-
-choice
-	prompt "Hypervisor mode"
-	default SHARING_MODE
+config INDUSTRY 
+	bool "Industry VMs"
 	help
-	  Select the usage mode of the hypervisor.
-
-config SHARING_MODE
-	bool "Sharing mode"
-	help
-	  In sharing mode, the first VM (called Service OS or SOS) is capable of
-	  managing the other VMs (called User OS or UOS) and trap/mediate their
-	  I/O accesses to physical devices.
-
-config PARTITION_MODE
-	bool "Partition mode"
-	help
-	  In partition mode, every VM owns part of the physical resources
-	  exclusively and runs with minimal interference from the others. The VM
-	  configurations are statically defined in the source.
+	  This scenario is a typical scenario for industry usage with 4 VMs: 
+	  one pre-launched SOS VM, one post-launched Standard VM for HMI, one or two
+	  post-launched  RT VM for real-time control.
 
 endchoice
 
@@ -249,15 +234,6 @@ config SOS_RAM_SIZE
 	help
 	  A 64-bit integer indicating the size of the User OS RAM (MMIO not
 	  included). Now we assume each UOS uses same amount of RAM size.
-
-config CONSTANT_ACPI
-	bool "The platform ACPI info is constant"
-	default n
-	help
-	  Whether constant ACPI tables shall be used. If selected, the built-in
-	  ACPI tables, usually generated on target platforms by an offline tool,
-	  will be used. If not a fixup subroutine will be invoked to update the
-	  built-in tables after parsing the real ACPI tables at runtime.
 
 config DMAR_PARSE_ENABLED
 	bool "Enable ACPI DMA Remapping tables parsing"

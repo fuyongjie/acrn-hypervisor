@@ -66,6 +66,7 @@
 #include "vmcfg.h"
 #include "tpm.h"
 #include "virtio.h"
+#include "log.h"
 
 #define GUEST_NIO_PORT		0x488	/* guest upcalls via i/o port */
 
@@ -140,7 +141,8 @@ usage(int code)
 		"       %*s [-s pci] [-U uuid] [--vsbl vsbl_file_name] [--ovmf ovmf_file_path]\n"
 		"       %*s [--part_info part_info_name] [--enable_trusty] [--intr_monitor param_setting]\n"
 		"       %*s [--vtpm2 sock_path] [--virtio_poll interval] [--mac_seed seed_string]\n"
-		"       %*s [--vmcfg sub_options] [--dump vm_idx] [--ptdev_no_reset] [--debugexit] <vm>\n"
+		"       %*s [--vmcfg sub_options] [--dump vm_idx] [--ptdev_no_reset] [--debugexit] \n"
+		"       %*s [--logger-setting param_setting] <vm>\n"
 		"       -A: create ACPI tables\n"
 		"       -B: bootargs for kernel\n"
 		"       -c: # cpus (default 1)\n"
@@ -174,10 +176,12 @@ usage(int code)
 		"       --virtio_poll: enable virtio poll mode with poll interval with ns\n"
 		"       --vtpm2: Virtual TPM2 args: sock_path=$PATH_OF_SWTPM_SOCKET\n"
 		"       --lapic_pt: enable local apic passthrough\n"
-		"       --rtvm: indicate that the guest is rtvm\n",
+		"       --rtvm: indicate that the guest is rtvm\n"
+		"       --logger_setting: params like console,level=4;kmsg,level=3\n",
 		progname, (int)strnlen(progname, PATH_MAX), "", (int)strnlen(progname, PATH_MAX), "",
 		(int)strnlen(progname, PATH_MAX), "", (int)strnlen(progname, PATH_MAX), "",
-		(int)strnlen(progname, PATH_MAX), "", (int)strnlen(progname, PATH_MAX), "");
+		(int)strnlen(progname, PATH_MAX), "", (int)strnlen(progname, PATH_MAX), "",
+		(int)strnlen(progname, PATH_MAX), "");
 
 	exit(code);
 }
@@ -720,6 +724,7 @@ enum {
 	CMD_OPT_VTPM2,
 	CMD_OPT_LAPIC_PT,
 	CMD_OPT_RTVM,
+	CMD_OPT_LOGGER_SETTING,
 };
 
 static struct option long_options[] = {
@@ -760,6 +765,7 @@ static struct option long_options[] = {
 	{"vtpm2",		required_argument,	0, CMD_OPT_VTPM2},
 	{"lapic_pt",		no_argument,		0, CMD_OPT_LAPIC_PT},
 	{"rtvm",		no_argument,		0, CMD_OPT_RTVM},
+	{"logger_setting",	required_argument,	0, CMD_OPT_LOGGER_SETTING},
 	{0,			0,			0,  0  },
 };
 
@@ -922,6 +928,12 @@ dm_run(int argc, char *argv[])
 				exit(1);
 			}
 			break;
+		case CMD_OPT_LOGGER_SETTING:
+			if (init_logger_setting(optarg) != 0) {
+				errx(EX_USAGE, "invalid logger setting params %s", optarg);
+				exit(1);
+			}
+			break;
 		case 'h':
 			usage(0);
 		default:
@@ -935,51 +947,52 @@ dm_run(int argc, char *argv[])
 		usage(1);
 
 	if (!check_hugetlb_support()) {
-		fprintf(stderr, "check_hugetlb_support failed\n");
+		pr_err("check_hugetlb_support failed\n");
 		exit(1);
 	}
 
 	vmname = argv[0];
 	if (strnlen(vmname, MAX_VM_OS_NAME_LEN) >= MAX_VM_OS_NAME_LEN) {
-		fprintf(stderr, "vmname size exceed %u\n",MAX_VM_OS_NAME_LEN);
+		pr_err("vmname size exceed %u\n", MAX_VM_OS_NAME_LEN);
 		exit(1);
 	}
 
 	for (;;) {
+		pr_notice("vm_create: %s\n", vmname);
 		ctx = vm_create(vmname, (unsigned long)vhm_req_buf);
 		if (!ctx) {
-			perror("vm_open");
+			pr_err("vm_create failed");
 			exit(1);
 		}
 
 		if (guest_ncpus < 1) {
-			fprintf(stderr, "Invalid guest vCPUs (%d)\n",
-				guest_ncpus);
+			pr_err("Invalid guest vCPUs (%d)\n", guest_ncpus);
 			goto fail;
 		}
 
 		max_vcpus = num_vcpus_allowed(ctx);
 		if (guest_ncpus > max_vcpus) {
-			fprintf(stderr, "%d vCPUs requested but %d available\n",
+			pr_err("%d vCPUs requested but %d available\n",
 				guest_ncpus, max_vcpus);
 			goto fail;
 		}
 
+		pr_notice("vm_setup_memory: size=0x%lx\n", memsize);
 		err = vm_setup_memory(ctx, memsize);
 		if (err) {
-			fprintf(stderr, "Unable to setup memory (%d)\n", errno);
+			pr_err("Unable to setup memory (%d)\n", errno);
 			goto fail;
 		}
 
 		err = mevent_init();
 		if (err) {
-			fprintf(stderr, "Unable to initialize mevent (%d)\n",
-				errno);
+			pr_err("Unable to initialize mevent (%d)\n", errno);
 			goto mevent_fail;
 		}
 
+		pr_notice("vm_init_vdevs\n");
 		if (vm_init_vdevs(ctx) < 0) {
-			fprintf(stderr, "Unable to init vdev (%d)\n", errno);
+			pr_err("Unable to init vdev (%d)\n", errno);
 			goto dev_fail;
 		}
 
@@ -995,13 +1008,18 @@ dm_run(int argc, char *argv[])
 
 		if (acpi) {
 			error = acpi_build(ctx, guest_ncpus);
-			if (error)
+			if (error) {
+				pr_err("acpi_build failed, error=%d\n", error);
 				goto vm_fail;
+			}
 		}
 
+		pr_notice("acrn_sw_load\n");
 		error = acrn_sw_load(ctx);
-		if (error)
+		if (error) {
+			pr_err("acrn_sw_load failed, error=%d\n", error);
 			goto vm_fail;
+		}
 
 		/*
 		 * Change the proc title to include the VM name.
@@ -1011,9 +1029,12 @@ dm_run(int argc, char *argv[])
 		/*
 		 * Add CPU 0
 		 */
+		pr_notice("add_cpu\n");
 		error = add_cpu(ctx, guest_ncpus);
-		if (error)
+		if (error) {
+			pr_err("add_cpu failed, error=%d\n", error);
 			goto vm_fail;
+		}
 
 		/* Make a copy for ctx */
 		_ctx = ctx;

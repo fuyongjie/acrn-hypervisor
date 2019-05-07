@@ -63,7 +63,7 @@ The ACRN hypervisor can support both Linux\* VM and Android\* VM as a
 User OS, with the User OS managed by the ACRN hypervisor. Developers and
 OEMs can use this reference stack to run their own VMs, together with
 IC, IVI, and RSE VMs. The Service OS runs as SOS_VM (also known as Dom0 in
-other hypervisors) and the User OS runs as NORMAL_VM, (also known as DomU).
+other hypervisors) and the User OS runs as POST_LAUNCHED_VM, (also known as DomU).
 
 :numref:`ivi-block` shows an example block diagram of using the ACRN
 hypervisor.
@@ -130,7 +130,7 @@ In the automotive example we described above, the User OS is the central
 hub of vehicle control and in-vehicle entertainment. It provides support
 for radio and entertainment options, control of the vehicle climate
 control, and vehicle navigation displays. It also provides connectivity
-options for using USB, Bluetooth, and WiFi for third-party device
+options for using USB, Bluetooth, and Wi-Fi for third-party device
 interaction with the vehicle, such as Android Auto\* or Apple CarPlay*,
 and many other features.
 
